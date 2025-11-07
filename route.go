@@ -3,6 +3,7 @@ package netlink
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 )
 
@@ -67,6 +68,9 @@ type Route struct {
 	Dst              *net.IPNet
 	Src              net.IP
 	Gw               net.IP
+	DstPrefix        netip.Prefix
+	SrcAddr          netip.Addr
+	GwAddr           netip.Addr
 	MultiPath        []*NexthopInfo
 	Protocol         RouteProtocol
 	Priority         int
@@ -110,6 +114,8 @@ func (r Route) String() string {
 	}
 	if r.MPLSDst != nil {
 		elems = append(elems, fmt.Sprintf("Dst: %d", r.MPLSDst))
+	} else if r.DstPrefix.IsValid() {
+		elems = append(elems, fmt.Sprintf("Dst: %s", r.DstPrefix))
 	} else {
 		elems = append(elems, fmt.Sprintf("Dst: %s", r.Dst))
 	}
@@ -122,9 +128,17 @@ func (r Route) String() string {
 	if r.Via != nil {
 		elems = append(elems, fmt.Sprintf("Via: %s", r.Via))
 	}
-	elems = append(elems, fmt.Sprintf("Src: %s", r.Src))
+
+	if r.SrcAddr.IsValid() {
+		elems = append(elems, fmt.Sprintf("Src: %s", r.SrcAddr))
+	} else {
+		elems = append(elems, fmt.Sprintf("Src: %s", r.Src))
+	}
+
 	if len(r.MultiPath) > 0 {
 		elems = append(elems, fmt.Sprintf("Gw: %s", r.MultiPath))
+	} else if r.GwAddr.IsValid() {
+		elems = append(elems, fmt.Sprintf("Gw: %s", r.GwAddr))
 	} else {
 		elems = append(elems, fmt.Sprintf("Gw: %s", r.Gw))
 	}
@@ -147,6 +161,9 @@ func (r Route) Equal(x Route) bool {
 		ipNetEqual(r.Dst, x.Dst) &&
 		r.Src.Equal(x.Src) &&
 		r.Gw.Equal(x.Gw) &&
+		r.DstPrefix == x.DstPrefix &&
+		r.SrcAddr == x.SrcAddr &&
+		r.GwAddr == x.GwAddr &&
 		nexthopInfoSlice(r.MultiPath).Equal(x.MultiPath) &&
 		r.Protocol == x.Protocol &&
 		r.Priority == x.Priority &&
