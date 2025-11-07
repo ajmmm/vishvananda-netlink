@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"syscall"
@@ -910,26 +911,48 @@ func (h *Handle) routeHandleIter(route *Route, req *nl.NetlinkRequest, msg *nl.R
 	return req.ExecuteIter(unix.NETLINK_ROUTE, 0, f)
 }
 
+func (h *Handle) translateRouteAddrs(route *Route) error {
+	if route.DstPrefix.IsValid() {
+		// If we have a new DstPrefix, make sure either SrcAddr or GwAddr are set
+		if !route.SrcAddr.IsValid() && !route.GwAddr.IsValid() {
+			return fmt.Errorf("either SrcAddr or GwAddr must be set")
+		}
+
+		// Overwrite the old members for data consistency
+		dst, err := NetPrefixToNetIP(route.DstPrefix)
+		if err != nil {
+			return err
+		}
+
+		route.Dst = dst
+		route.Src, _ = NetAddrToNetIP(route.SrcAddr)
+		route.Gw, _ = NetAddrToNetIP(route.GwAddr)
+	} else {
+		if (route.Dst == nil || route.Dst.IP == nil) && route.Src == nil && route.Gw == nil {
+			return fmt.Errorf("either Dst.IP, src.IP or Gw must be set")
+		}
+
+		// Overwrite the new members as we'll operate on these moving forward
+		route.DstPrefix, _ = NetIPNetToNetPrefix(route.Dst)
+		route.SrcAddr, _ = NetIPToNetAddr(route.Src)
+		route.GwAddr, _ = NetIPToNetAddr(route.Gw)
+	}
+	return nil
+}
+
 func (h *Handle) prepareRouteReq(route *Route, req *nl.NetlinkRequest, msg *nl.RtMsg) error {
-	if req.NlMsghdr.Type != unix.RTM_GETROUTE && (route.Dst == nil || route.Dst.IP == nil) && route.Src == nil && route.Gw == nil && route.MPLSDst == nil {
-		return fmt.Errorf("either Dst.IP, Src.IP or Gw must be set")
+	err := h.translateRouteAddrs(route)
+	if req.NlMsghdr.Type != unix.RTM_GETROUTE && err != nil && route.MPLSDst == nil {
+		return fmt.Errorf("invalid request: %w", err)
 	}
 
 	family := -1
 	var rtAttrs []*nl.RtAttr
 
-	if route.Dst != nil && route.Dst.IP != nil {
-		dstLen, _ := route.Dst.Mask.Size()
-		msg.Dst_len = uint8(dstLen)
-		dstFamily := nl.GetIPFamily(route.Dst.IP)
-		family = dstFamily
-		var dstData []byte
-		if dstFamily == FAMILY_V4 {
-			dstData = route.Dst.IP.To4()
-		} else {
-			dstData = route.Dst.IP.To16()
-		}
-		rtAttrs = append(rtAttrs, nl.NewRtAttr(unix.RTA_DST, dstData))
+	if route.DstPrefix.IsValid() {
+		msg.Dst_len = uint8(route.DstPrefix.Bits())
+		family = nl.GetNetPrefixAddrFamily(route.DstPrefix)
+		rtAttrs = append(rtAttrs, nl.NewRtAttr(unix.RTA_DST, route.DstPrefix.Masked().Addr().AsSlice()))
 	} else if route.MPLSDst != nil {
 		family = nl.FAMILY_MPLS
 		msg.Dst_len = uint8(20)
@@ -965,35 +988,23 @@ func (h *Handle) prepareRouteReq(route *Route, req *nl.NetlinkRequest, msg *nl.R
 
 	}
 
-	if route.Src != nil {
-		srcFamily := nl.GetIPFamily(route.Src)
+	if route.SrcAddr.IsValid() {
+		srcFamily := nl.GetNetIPAddrFamily(route.SrcAddr)
 		if family != -1 && family != srcFamily {
 			return fmt.Errorf("source and destination ip are not the same IP family")
 		}
 		family = srcFamily
-		var srcData []byte
-		if srcFamily == FAMILY_V4 {
-			srcData = route.Src.To4()
-		} else {
-			srcData = route.Src.To16()
-		}
 		// The commonly used src ip for routes is actually PREFSRC
-		rtAttrs = append(rtAttrs, nl.NewRtAttr(unix.RTA_PREFSRC, srcData))
+		rtAttrs = append(rtAttrs, nl.NewRtAttr(unix.RTA_PREFSRC, route.SrcAddr.AsSlice()))
 	}
 
-	if route.Gw != nil {
-		gwFamily := nl.GetIPFamily(route.Gw)
+	if route.GwAddr.IsValid() {
+		gwFamily := nl.GetNetIPAddrFamily(route.GwAddr)
 		if family != -1 && family != gwFamily {
 			return fmt.Errorf("gateway, source, and destination ip are not the same IP family")
 		}
 		family = gwFamily
-		var gwData []byte
-		if gwFamily == FAMILY_V4 {
-			gwData = route.Gw.To4()
-		} else {
-			gwData = route.Gw.To16()
-		}
-		rtAttrs = append(rtAttrs, nl.NewRtAttr(unix.RTA_GATEWAY, gwData))
+		rtAttrs = append(rtAttrs, nl.NewRtAttr(unix.RTA_GATEWAY, route.GwAddr.AsSlice()))
 	}
 
 	if route.Via != nil {
@@ -1386,10 +1397,11 @@ func deserializeRoute(m []byte) (Route, error) {
 				}
 				route.MPLSDst = &stack[0]
 			} else {
-				route.Dst = &net.IPNet{
-					IP:   attr.Value,
-					Mask: net.CIDRMask(int(msg.Dst_len), 8*len(attr.Value)),
+				route.DstPrefix, err = NetPrefixFrom(attr.Value, int(msg.Dst_len))
+				if err != nil {
+					return route, err
 				}
+				route.Dst, _ = NetPrefixToNetIP(route.DstPrefix)
 			}
 		case unix.RTA_OIF:
 			route.LinkIndex = int(native.Uint32(attr.Value[0:4]))
@@ -1547,23 +1559,17 @@ func deserializeRoute(m []byte) (Route, error) {
 	}
 
 	// Same logic to generate "default" dst with iproute2 implementation
-	if route.Dst == nil {
-		var addLen int
-		var ip net.IP
+	if !route.DstPrefix.IsValid() {
+		var ip netip.Addr
 		switch msg.Family {
 		case FAMILY_V4:
-			addLen = net.IPv4len
-			ip = net.IPv4zero
+			ip = netip.IPv4Unspecified()
 		case FAMILY_V6:
-			addLen = net.IPv6len
-			ip = net.IPv6zero
+			ip = netip.IPv6Unspecified()
 		}
-
-		if addLen != 0 {
-			route.Dst = &net.IPNet{
-				IP:   ip,
-				Mask: net.CIDRMask(int(msg.Dst_len), 8*addLen),
-			}
+		if ip.IsValid() {
+			route.DstPrefix = netip.PrefixFrom(ip, ip.BitLen())
+			route.Dst, _ = NetPrefixToNetIP(route.DstPrefix)
 		}
 	}
 
