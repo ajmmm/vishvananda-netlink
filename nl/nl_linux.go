@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"sync"
@@ -73,6 +74,38 @@ func GetIPFamily(ip net.IP) int {
 		return FAMILY_V4
 	}
 	if ip.To4() != nil {
+		return FAMILY_V4
+	}
+	return FAMILY_V6
+}
+
+// GetNetIPAddrFamily returns the family type of a netip.Addr.
+//
+// If addr is invalid, this routine will panic. Rationale for this is to
+// pick up validation errors during transition from net.IP to netip.Addr.
+//
+// The alternative would be to force the caller to always check for errors.
+func GetNetIPAddrFamily(addr netip.Addr) int {
+	if !addr.IsValid() {
+		panic("invalid IP Address detected")
+	}
+	if addr.Is4() {
+		return FAMILY_V4
+	}
+	return FAMILY_V6
+}
+
+// GetNetPrefixAddrFamily returns the family type of a netip.Prefix.
+//
+// If prefix is invalid, this routine will panic. Rationale for this is to
+// pick up validation errors during transition from net.IP to netip.Prefix.
+//
+// The alternative would be to force the caller to always check for errors.
+func GetNetPrefixAddrFamily(prefix netip.Prefix) int {
+	if !prefix.IsValid() {
+		panic("invalid IP Prefix detected")
+	}
+	if prefix.Addr().Is4() {
 		return FAMILY_V4
 	}
 	return FAMILY_V6
