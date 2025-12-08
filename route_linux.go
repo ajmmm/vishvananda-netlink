@@ -1642,132 +1642,136 @@ func deserializeRoute(m []byte) (Route, error) {
 // RouteGetOptions contains a set of options to use with
 // RouteGetWithOptions
 type RouteGetOptions struct {
-	Iif      string
-	IifIndex int
-	Oif      string
-	OifIndex int
-	VrfName  string
-	SrcAddr  net.IP
-	UID      *uint32
-	Mark     uint32
-	FIBMatch bool
+	Iif        string
+	IifIndex   int
+	Oif        string
+	OifIndex   int
+	VrfName    string
+	SrcAddress netip.Addr
+	SrcAddr    net.IP
+	UID        *uint32
+	Mark       uint32
+	FIBMatch   bool
 }
 
-// RouteGetWithOptions gets a route to a specific destination from the host system.
-// Equivalent to: 'ip route get <> vrf <VrfName>'.
-func RouteGetWithOptions(destination net.IP, options *RouteGetOptions) ([]Route, error) {
-	return pkgHandle.RouteGetWithOptions(destination, options)
+type RouteGetContext struct {
+	DstAddress netip.Addr
+	RouteGetOptions
 }
 
-// RouteGet gets a route to a specific destination from the host system.
-// Equivalent to: 'ip route get'.
-func RouteGet(destination net.IP) ([]Route, error) {
-	return pkgHandle.RouteGet(destination)
-}
+// Preparation logic to clone the provided options for the underlying internal API.
+// At some point, destination should be provided fully via the options structure.
+func (h *Handle) routeGetPrepareContext(dst net.IP, options *RouteGetOptions) (RouteGetContext, error) {
+	get := RouteGetContext{}
 
-// RouteGetWithOptions gets a route to a specific destination from the host system.
-// Equivalent to: 'ip route get <> vrf <VrfName>'.
-func (h *Handle) RouteGetWithOptions(destination net.IP, options *RouteGetOptions) ([]Route, error) {
-	req := h.newNetlinkRequest(unix.RTM_GETROUTE, unix.NLM_F_REQUEST)
-	family := nl.GetIPFamily(destination)
-	var destinationData []byte
-	var bitlen uint8
-	if family == FAMILY_V4 {
-		destinationData = destination.To4()
-		bitlen = 32
-	} else {
-		destinationData = destination.To16()
-		bitlen = 128
+	// Insert the destination address
+	dstAddr, err := NetIPToNetAddr(dst)
+	if err != nil {
+		return RouteGetContext{}, fmt.Errorf("invalid DstAddress: %w", err)
 	}
+
+	get.DstAddress = dstAddr
+	if options != nil {
+		get.RouteGetOptions = *options
+	}
+
+	// Ensure we overwrite the legacy SrcAddr so that SrcAddress takes precedent.
+	// This should be deleted when SrcAddr is removed.
+	if get.SrcAddress.IsValid() {
+		get.SrcAddr, _ = NetAddrToNetIP(get.SrcAddress)
+	} else if get.SrcAddr != nil {
+		get.SrcAddress, _ = NetIPToNetAddr(get.SrcAddr)
+	}
+
+	return get, nil
+}
+
+// Internal API that operates on local version of GetRouteOptions
+func (h *Handle) routeGetWithContext(get RouteGetContext) ([]Route, error) {
+	if !get.DstAddress.IsValid() {
+		return nil, fmt.Errorf("invalid DstAddress")
+	}
+
+	family := nl.GetNetIPAddrFamily(get.DstAddress)
+	bitlen := uint8(get.DstAddress.BitLen())
+
 	msg := &nl.RtMsg{}
 	msg.Family = uint8(family)
 	msg.Dst_len = bitlen
-	if options != nil && options.SrcAddr != nil {
+	if get.SrcAddress.IsValid() {
 		msg.Src_len = bitlen
 	}
+
 	msg.Flags = unix.RTM_F_LOOKUP_TABLE
-	if options != nil && options.FIBMatch {
+	if get.FIBMatch {
 		msg.Flags |= unix.RTM_F_FIB_MATCH
 	}
+
+	req := h.newNetlinkRequest(unix.RTM_GETROUTE, unix.NLM_F_REQUEST)
 	req.AddData(msg)
 
-	rtaDst := nl.NewRtAttr(unix.RTA_DST, destinationData)
+	rtaDst := nl.NewRtAttr(unix.RTA_DST, get.DstAddress.AsSlice())
 	req.AddData(rtaDst)
 
-	if options != nil {
-		if options.VrfName != "" {
-			link, err := h.LinkByName(options.VrfName)
-			if err != nil {
-				return nil, err
-			}
-			b := make([]byte, 4)
-			native.PutUint32(b, uint32(link.Attrs().Index))
+	if get.VrfName != "" {
+		link, err := h.LinkByName(get.VrfName)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 4)
+		native.PutUint32(b, uint32(link.Attrs().Index))
 
-			req.AddData(nl.NewRtAttr(unix.RTA_OIF, b))
+		req.AddData(nl.NewRtAttr(unix.RTA_OIF, b))
+	}
+
+	iifIndex := 0
+	if len(get.Iif) > 0 {
+		link, err := h.LinkByName(get.Iif)
+		if err != nil {
+			return nil, err
 		}
 
-		iifIndex := 0
-		if len(options.Iif) > 0 {
-			link, err := h.LinkByName(options.Iif)
-			if err != nil {
-				return nil, err
-			}
+		iifIndex = link.Attrs().Index
+	} else if get.IifIndex > 0 {
+		iifIndex = get.IifIndex
+	}
+	if iifIndex > 0 {
+		b := make([]byte, 4)
+		native.PutUint32(b, uint32(iifIndex))
 
-			iifIndex = link.Attrs().Index
-		} else if options.IifIndex > 0 {
-			iifIndex = options.IifIndex
+		req.AddData(nl.NewRtAttr(unix.RTA_IIF, b))
+	}
+
+	oifIndex := uint32(0)
+	if len(get.Oif) > 0 {
+		link, err := h.LinkByName(get.Oif)
+		if err != nil {
+			return nil, err
 		}
+		oifIndex = uint32(link.Attrs().Index)
+	} else if get.OifIndex > 0 {
+		oifIndex = uint32(get.OifIndex)
+	}
+	if oifIndex > 0 {
+		b := make([]byte, 4)
+		native.PutUint32(b, oifIndex)
+		req.AddData(nl.NewRtAttr(unix.RTA_OIF, b))
+	}
 
-		if iifIndex > 0 {
-			b := make([]byte, 4)
-			native.PutUint32(b, uint32(iifIndex))
+	if get.SrcAddress.IsValid() {
+		req.AddData(nl.NewRtAttr(unix.RTA_SRC, get.SrcAddress.AsSlice()))
+	}
 
-			req.AddData(nl.NewRtAttr(unix.RTA_IIF, b))
-		}
+	if get.UID != nil {
+		b := make([]byte, 4)
+		native.PutUint32(b, *get.UID)
+		req.AddData(nl.NewRtAttr(unix.RTA_UID, b))
+	}
 
-		oifIndex := uint32(0)
-		if len(options.Oif) > 0 {
-			link, err := h.LinkByName(options.Oif)
-			if err != nil {
-				return nil, err
-			}
-			oifIndex = uint32(link.Attrs().Index)
-		} else if options.OifIndex > 0 {
-			oifIndex = uint32(options.OifIndex)
-		}
-
-		if oifIndex > 0 {
-			b := make([]byte, 4)
-			native.PutUint32(b, oifIndex)
-
-			req.AddData(nl.NewRtAttr(unix.RTA_OIF, b))
-		}
-
-		if options.SrcAddr != nil {
-			var srcAddr []byte
-			if family == FAMILY_V4 {
-				srcAddr = options.SrcAddr.To4()
-			} else {
-				srcAddr = options.SrcAddr.To16()
-			}
-
-			req.AddData(nl.NewRtAttr(unix.RTA_SRC, srcAddr))
-		}
-
-		if options.UID != nil {
-			uid := *options.UID
-			b := make([]byte, 4)
-			native.PutUint32(b, uid)
-
-			req.AddData(nl.NewRtAttr(unix.RTA_UID, b))
-		}
-
-		if options.Mark > 0 {
-			b := make([]byte, 4)
-			native.PutUint32(b, options.Mark)
-
-			req.AddData(nl.NewRtAttr(unix.RTA_MARK, b))
-		}
+	if get.Mark > 0 {
+		b := make([]byte, 4)
+		native.PutUint32(b, get.Mark)
+		req.AddData(nl.NewRtAttr(unix.RTA_MARK, b))
 	}
 
 	msgs, err := req.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWROUTE)
@@ -1786,10 +1790,52 @@ func (h *Handle) RouteGetWithOptions(destination net.IP, options *RouteGetOption
 	return res, nil
 }
 
+// RouteGetWithOptions gets a route to a specific destination from the host system.
+// Equivalent to: 'ip route get <> vrf <VrfName>'.
+func RouteGetWithOptions(destination net.IP, options *RouteGetOptions) ([]Route, error) {
+	get, err := pkgHandle.routeGetPrepareContext(destination, options)
+	if err != nil {
+		return nil, err
+	}
+	return pkgHandle.routeGetWithContext(get)
+}
+
+// RouteGet gets a route to a specific destination from the host system.
+// Equivalent to: 'ip route get'.
+func RouteGet(destination net.IP) ([]Route, error) {
+	get, err := pkgHandle.routeGetPrepareContext(destination, nil)
+	if err != nil {
+		return nil, err
+	}
+	return pkgHandle.routeGetWithContext(get)
+}
+
+func RouteGetWithContext(get RouteGetContext) ([]Route, error) {
+	return pkgHandle.routeGetWithContext(get)
+}
+
+// RouteGetWithOptions gets a route to a specific destination from the host system.
+// Equivalent to: 'ip route get <> vrf <VrfName>'.
+func (h *Handle) RouteGetWithOptions(destination net.IP, options *RouteGetOptions) ([]Route, error) {
+	get, err := h.routeGetPrepareContext(destination, options)
+	if err != nil {
+		return nil, err
+	}
+	return h.routeGetWithContext(get)
+}
+
 // RouteGet gets a route to a specific destination from the host system.
 // Equivalent to: 'ip route get'.
 func (h *Handle) RouteGet(destination net.IP) ([]Route, error) {
-	return h.RouteGetWithOptions(destination, nil)
+	get, err := h.routeGetPrepareContext(destination, nil)
+	if err != nil {
+		return nil, err
+	}
+	return h.routeGetWithContext(get)
+}
+
+func (h *Handle) RouteGetWithContext(get RouteGetContext) ([]Route, error) {
+	return h.routeGetWithContext(get)
 }
 
 // RouteSubscribe takes a chan down which notifications will be sent
